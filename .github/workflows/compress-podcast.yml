@@ -1,0 +1,178 @@
+name: Compress Podcast MP4 to MP3
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: "Public Google Drive download URL of the MP4"
+        required: true
+      file_name:
+        description: "Original file name (e.g. SteveJobs.mp4)"
+        required: true
+      n8n_callback_url:
+        description: "n8n webhook URL to POST results back to"
+        required: true
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. Install FFmpeg
+      # ─────────────────────────────────────────────
+      - name: Install FFmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      # ─────────────────────────────────────────────
+      # 2. Download MP4 from public Google Drive URL
+      #    GDrive public links need a confirm token
+      #    for files >40MB — this handles that.
+      # ─────────────────────────────────────────────
+      - name: Download MP4 from Google Drive
+        run: |
+          FILE_URL="${{ github.event.inputs.download_url }}"
+          FILE_NAME="${{ github.event.inputs.file_name }}"
+
+          echo "Downloading: $FILE_NAME"
+
+          # Use gdown to handle GDrive large file confirmation automatically
+          pip install gdown --quiet
+          gdown "$FILE_URL" -O "input.mp4" --fuzzy
+
+          echo "Download complete. File size: $(du -sh input.mp4 | cut -f1)"
+
+      # ─────────────────────────────────────────────
+      # 3. Calculate target bitrate so output < 25MB
+      #    Formula: bitrate = (24 * 8192) / duration_seconds
+      #    We use 24MB as target (leaving 1MB buffer)
+      # ─────────────────────────────────────────────
+      - name: Calculate target bitrate
+        id: calc
+        run: |
+          DURATION=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 input.mp4)
+          DURATION_INT=$(echo "$DURATION" | awk '{print int($1)}')
+
+          echo "Duration: ${DURATION_INT}s"
+
+          # Target = 24MB in kilobits / duration
+          # (24 * 1024 * 8) = 196608 kilobits
+          TARGET_BITRATE=$(echo "scale=0; 196608 / $DURATION_INT" | bc)
+
+          # Cap at 128k (overkill for speech) and floor at 16k (minimum)
+          if [ "$TARGET_BITRATE" -gt 128 ]; then TARGET_BITRATE=128; fi
+          if [ "$TARGET_BITRATE" -lt 16 ]; then TARGET_BITRATE=16; fi
+
+          echo "Target bitrate: ${TARGET_BITRATE}k"
+          echo "bitrate=${TARGET_BITRATE}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION_INT}" >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────────
+      # 4. Convert MP4 → MP3
+      #    -vn         : strip video track
+      #    -acodec     : use MP3 encoder
+      #    -b:a        : dynamic bitrate from step above
+      #    -ar 16000   : 16kHz sample rate (Whisper-optimised)
+      #    -ac 1       : mono (halves size, fine for speech)
+      # ─────────────────────────────────────────────
+      - name: Convert MP4 to MP3
+        run: |
+          MP3_NAME="${{ github.event.inputs.file_name }}"
+          MP3_NAME="${MP3_NAME%.mp4}.mp3"
+          BITRATE="${{ steps.calc.outputs.bitrate }}"
+
+          echo "Converting to MP3 at ${BITRATE}k..."
+
+          ffmpeg -i input.mp4 \
+            -vn \
+            -acodec libmp3lame \
+            -b:a "${BITRATE}k" \
+            -ar 16000 \
+            -ac 1 \
+            "output.mp3"
+
+          MP3_SIZE=$(du -sh output.mp3 | cut -f1)
+          MP3_SIZE_BYTES=$(wc -c < output.mp3)
+          echo "MP3 size: $MP3_SIZE ($MP3_SIZE_BYTES bytes)"
+          echo "mp3_name=${MP3_NAME}" >> $GITHUB_ENV
+          echo "mp3_size_bytes=${MP3_SIZE_BYTES}" >> $GITHUB_ENV
+
+          # Safety check — fail loudly if still over 25MB
+          if [ "$MP3_SIZE_BYTES" -gt 26214400 ]; then
+            echo "ERROR: Output MP3 is still over 25MB! Duration may exceed our estimate."
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────
+      # 5. Upload MP3 to Cloudinary as a raw file
+      #    Raw type = no transformation credits used,
+      #    just plain file storage + CDN delivery
+      # ─────────────────────────────────────────────
+      - name: Upload MP3 to Cloudinary
+        id: cloudinary
+        run: |
+          CLOUD_NAME="${{ secrets.CLOUDINARY_CLOUD_NAME }}"
+          API_KEY="${{ secrets.CLOUDINARY_API_KEY }}"
+          API_SECRET="${{ secrets.CLOUDINARY_API_SECRET }}"
+          MP3_NAME="${{ env.mp3_name }}"
+
+          TIMESTAMP=$(date +%s)
+          PUBLIC_ID="podcasts/${MP3_NAME%.mp3}"
+
+          # Generate SHA-1 signature: sign "public_id=...&timestamp=...{api_secret}"
+          SIGNATURE=$(echo -n "public_id=${PUBLIC_ID}&timestamp=${TIMESTAMP}${API_SECRET}" | sha1sum | awk '{print $1}')
+
+          echo "Uploading $MP3_NAME to Cloudinary..."
+
+          RESPONSE=$(curl -s -X POST \
+            "https://api.cloudinary.com/v1_1/${CLOUD_NAME}/raw/upload" \
+            -F "file=@output.mp3" \
+            -F "public_id=${PUBLIC_ID}" \
+            -F "api_key=${API_KEY}" \
+            -F "timestamp=${TIMESTAMP}" \
+            -F "signature=${SIGNATURE}")
+
+          echo "Cloudinary response: $RESPONSE"
+
+          CLOUDINARY_URL=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('secure_url', ''))")
+
+          if [ -z "$CLOUDINARY_URL" ]; then
+            echo "ERROR: Failed to get Cloudinary URL"
+            exit 1
+          fi
+
+          echo "Uploaded to: $CLOUDINARY_URL"
+          echo "cloudinary_url=${CLOUDINARY_URL}" >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────────
+      # 6. POST results back to n8n
+      #    n8n resumes its workflow from the Wait node
+      # ─────────────────────────────────────────────
+      - name: Send callback to n8n
+        run: |
+          curl -s -X POST "${{ github.event.inputs.n8n_callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "success",
+              "file_name": "${{ github.event.inputs.file_name }}",
+              "mp3_name": "${{ env.mp3_name }}",
+              "mp3_size_bytes": ${{ env.mp3_size_bytes }},
+              "duration_seconds": ${{ steps.calc.outputs.duration }},
+              "cloudinary_url": "${{ steps.cloudinary.outputs.cloudinary_url }}"
+            }'
+
+      # ─────────────────────────────────────────────
+      # 7. Callback on failure — so n8n isn't left
+      #    hanging on its Wait node forever
+      # ─────────────────────────────────────────────
+      - name: Notify n8n on failure
+        if: failure()
+        run: |
+          curl -s -X POST "${{ github.event.inputs.n8n_callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "error",
+              "file_name": "${{ github.event.inputs.file_name }}",
+              "message": "GitHub Actions job failed. Check workflow run logs."
+            }'
