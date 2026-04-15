@@ -28,6 +28,11 @@ jobs:
       # 2. Download MP4 from public Google Drive URL
       #    GDrive public links need a confirm token
       #    for files >40MB — this handles that.
+      #
+      #    Strategy:
+      #    - Extract the file ID from the URL
+      #    - Try wget first with cookie confirmation
+      #    - Fall back to gdown if wget gets an HTML page
       # ─────────────────────────────────────────────
       - name: Download MP4 from Google Drive
         run: |
@@ -36,11 +41,51 @@ jobs:
 
           echo "Downloading: $FILE_NAME"
 
-          # Use gdown to handle GDrive large file confirmation automatically
-          pip install gdown --quiet
-          gdown "$FILE_URL" -O "input.mp4" --fuzzy
+          # Extract file ID from the download URL
+          FILE_ID=$(echo "$FILE_URL" | grep -oP '(?<=id=)[^&]+')
+          echo "File ID: $FILE_ID"
+
+          # Method 1: wget with confirm token (works for most public files)
+          wget --quiet \
+            --save-cookies cookies.txt \
+            --keep-session-cookies \
+            --no-check-certificate \
+            "https://drive.google.com/uc?export=download&id=${FILE_ID}" \
+            -O input_check.html
+
+          # Check if we got an HTML warning page (large file confirm page)
+          if grep -q "confirm=" input_check.html 2>/dev/null; then
+            echo "Large file detected — using confirm token..."
+            CONFIRM=$(grep -oP '(?<=confirm=)[^&"]+' input_check.html | head -1)
+            wget --quiet \
+              --load-cookies cookies.txt \
+              --no-check-certificate \
+              "https://drive.google.com/uc?export=download&confirm=${CONFIRM}&id=${FILE_ID}" \
+              -O input.mp4
+          else
+            echo "Small file — using direct download..."
+            mv input_check.html input.mp4
+          fi
+
+          # Verify the file is a valid video (not an HTML error page)
+          FILE_TYPE=$(file --mime-type -b input.mp4)
+          echo "Downloaded file type: $FILE_TYPE"
+
+          if echo "$FILE_TYPE" | grep -q "text/html"; then
+            echo "⚠️ Got HTML instead of video — falling back to gdown..."
+            pip install gdown --quiet
+            gdown "https://drive.google.com/uc?id=${FILE_ID}" -O input.mp4
+          fi
 
           echo "Download complete. File size: $(du -sh input.mp4 | cut -f1)"
+
+          # Final check — make sure we actually have a video file
+          FINAL_TYPE=$(file --mime-type -b input.mp4)
+          if echo "$FINAL_TYPE" | grep -q "text/html"; then
+            echo "ERROR: Could not download video file. Got HTML page instead."
+            echo "Make sure the file is set to 'Anyone with link' in Google Drive."
+            exit 1
+          fi
 
       # ─────────────────────────────────────────────
       # 3. Calculate target bitrate so output < 25MB
