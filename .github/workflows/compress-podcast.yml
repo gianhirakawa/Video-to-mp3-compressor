@@ -19,13 +19,27 @@ jobs:
 
     steps:
       # ─────────────────────────────────────────────
-      # 1. Install FFmpeg
+      # 1. Cache FFmpeg
       # ─────────────────────────────────────────────
-      - name: Install FFmpeg
-        run: sudo apt-get install -y ffmpeg
+      - name: Cache FFmpeg
+        uses: actions/cache@v3
+        with:
+          path: /usr/bin/ffmpeg
+          key: ffmpeg-ubuntu-latest
 
       # ─────────────────────────────────────────────
-      # 2. Download MP4 from public Google Drive URL
+      # 2. Install FFmpeg (skipped if cached)
+      # ─────────────────────────────────────────────
+      - name: Install FFmpeg
+        run: |
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get install -y ffmpeg
+          else
+            echo "✅ FFmpeg already cached, skipping install."
+          fi
+
+      # ─────────────────────────────────────────────
+      # 3. Download MP4 from public Google Drive URL
       #    GDrive public links need a confirm token
       #    for files >40MB — this handles that.
       #
@@ -88,7 +102,7 @@ jobs:
           fi
 
       # ─────────────────────────────────────────────
-      # 3. Calculate target bitrate so output < 25MB
+      # 4. Calculate target bitrate so output < 25MB
       #    Formula: bitrate = (24 * 8192) / duration_seconds
       #    We use 24MB as target (leaving 1MB buffer)
       # ─────────────────────────────────────────────
@@ -114,7 +128,7 @@ jobs:
           echo "duration=${DURATION_INT}" >> $GITHUB_OUTPUT
 
       # ─────────────────────────────────────────────
-      # 4. Convert MP4 → MP3
+      # 5. Convert MP4 → MP3
       #    -vn         : strip video track
       #    -acodec     : use MP3 encoder
       #    -b:a        : dynamic bitrate from step above
@@ -150,7 +164,7 @@ jobs:
           fi
 
       # ─────────────────────────────────────────────
-      # 5. Upload MP3 to Cloudinary as a raw file
+      # 6. Upload MP3 to Cloudinary as a raw file
       #    Raw type = no transformation credits used,
       #    just plain file storage + CDN delivery
       # ─────────────────────────────────────────────
@@ -191,7 +205,7 @@ jobs:
           echo "cloudinary_url=${CLOUDINARY_URL}" >> $GITHUB_OUTPUT
 
       # ─────────────────────────────────────────────
-      # 6. POST results back to n8n
+      # 7. POST results back to n8n
       #    n8n resumes its workflow from the Wait node
       # ─────────────────────────────────────────────
       - name: Send callback to n8n
@@ -208,7 +222,7 @@ jobs:
             }'
 
       # ─────────────────────────────────────────────
-      # 7. Callback on failure — so n8n isn't left
+      # 8. Callback on failure — so n8n isn't left
       #    hanging on its Wait node forever
       # ─────────────────────────────────────────────
       - name: Notify n8n on failure
